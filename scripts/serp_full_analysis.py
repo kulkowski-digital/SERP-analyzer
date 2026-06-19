@@ -259,7 +259,39 @@ async def crawl_pages(organic: list, out_dir: Path, crawl_retries: int = 2):
     return [entries[o["pos"]] for o in organic]
 
 
-def analyze(serp: dict, pages_meta: list) -> dict:
+def common_h2_themes(ok_pages: list, keyword: str, min_pages: int) -> list:
+    """Wyciąga powtarzalne tematy H2 z faktycznie sklawlowanych stron TOP10.
+
+    Zamiast zahardkodowanego szablonu zwraca tematy, które realnie powtarzają się
+    w nagłówkach H2 konkurencji (na ile odrębnych stron token się pojawia), wraz
+    z reprezentatywnym przykładem nagłówka. Tokeny samej frazy są pomijane.
+    """
+    query_tokens = set(re.findall(r"[a-ząćęłńóśżź0-9]{3,}", keyword.lower()))
+    token_pages = {}      # token -> set indeksów stron z tym tokenem w H2
+    token_examples = {}   # token -> Counter przykładowych nagłówków
+    for i, p in enumerate(ok_pages):
+        for h in p.get("h2", []):
+            tokens = [t for t in re.findall(r"[a-ząćęłńóśżź0-9]{4,}", h.lower())
+                      if t not in STOPWORDS and t not in query_tokens]
+            for t in tokens:
+                token_pages.setdefault(t, set()).add(i)
+                token_examples.setdefault(t, Counter())[h.strip()] += 1
+
+    themes = []
+    used_headings = set()
+    for tok, pages in sorted(token_pages.items(), key=lambda x: (-len(x[1]), x[0])):
+        if len(pages) < min_pages:
+            continue
+        example = next((h for h, _ in token_examples[tok].most_common()
+                        if h not in used_headings), None)
+        if not example:
+            continue
+        used_headings.add(example)
+        themes.append({"pages": len(pages), "example": example})
+    return themes[:12]
+
+
+def analyze(serp: dict, pages_meta: list, keyword: str) -> dict:
     results = serp.get("data", {}).get("results", {})
     snippets_found = results.get("snippets_found", []) or []
     snippets = results.get("snippets", {}) or {}
@@ -307,8 +339,11 @@ def analyze(serp: dict, pages_meta: list) -> dict:
         commercial_signals = section_presence.get("oferta / usługi", 0) + section_presence.get("kontakt / CTA", 0)
         intent = "komercyjna" if commercial_signals >= len(ok_pages) else "informacyjna/mieszana"
 
+    h2_themes = common_h2_themes(ok_pages, keyword, min_pages=max(2, len(ok_pages) // 3))
+
     return {
         "intent": intent,
+        "h2_themes": h2_themes,
         "has_local_pack": has_local,
         "has_ai_overview": has_ai,
         "snippets_found": snippets_found,
@@ -340,7 +375,11 @@ def build_report(keyword, gl, hl, device, serp, pages_meta, a) -> str:
         sig.append("- Obecny **AI Overview** → fraza częściowo informacyjna, warto pisać treści cytowalne (chunki, E-E-A-T).")
     if not a["has_local_pack"] and not a["has_ai_overview"]:
         sig.append("- Brak Local Pack i AI Overview → klasyczny ranking organiczny.")
-    sig.append(f"- W TOP10 dominują strony ofertowe/usługowe (sekcje oferta/kontakt obecne na większości stron).")
+    commercial = a["section_presence"].get("oferta / usługi", 0) + a["section_presence"].get("kontakt / CTA", 0)
+    if commercial >= n:
+        sig.append("- W treści TOP10 dominują sekcje ofertowo-kontaktowe → silny komponent komercyjny.")
+    else:
+        sig.append("- W treści TOP10 przeważają sekcje merytoryczno-poradnikowe → komponent informacyjny przy ewentualnym CTA.")
     L("\n".join(sig) + "\n")
 
     L("## 2. Najważniejsze elementy wspólne (co mają strony z TOP10)\n")
@@ -374,36 +413,26 @@ def build_report(keyword, gl, hl, device, serp, pages_meta, a) -> str:
     L("")
 
     L("## 4. Sugerowana struktura strony pod tę frazę\n")
-    L("Na podstawie wspólnych elementów TOP10 strona aspirująca do TOP powinna zawierać:\n")
-    # kolejność rekomendowanych sekcji wg częstości + zdrowy rozsądek
-    recommended = [s for s, c in a["section_presence"].items() if c >= max(1, n // 3)]
     h1 = keyword[0].upper() + keyword[1:]
-    L(f"**H1:** {h1} — (z jasną propozycją wartości + lokalizacją)\n")
-    blueprint = [
-        ("Hero + CTA", "nagłówek z frazą, podtytuł z USP, przycisk kontaktu/wyceny"),
-        ("oferta / usługi", "zakres usług (audyt, analiza fraz, link building, opieka)"),
-        ("proces / jak działamy", "kroki współpracy 1→4, buduje zaufanie"),
-        ("efekty / wyniki", "konkretne wzrosty, wykresy, liczby"),
-        ("opinie / referencje", "case studies + opinie klientów (E-E-A-T)"),
-        ("cennik / wycena", "widełki lub formularz wyceny"),
-        ("lokalność (geo)", "sekcja o obsłudze Warszawy/okolic, mapa, NAP"),
-        ("FAQ / pytania", "odpowiedzi na PAA – szansa na featured snippet"),
-        ("blog / poradniki", "treści wspierające autorytet tematyczny"),
-        ("kontakt / CTA", "formularz, telefon, darmowa konsultacja"),
-    ]
-    idx = 2
-    for sec, why in blueprint:
-        present = a["section_presence"].get(sec)
-        mark = ""
-        if present is not None:
-            mark = f"  _(na {present}/{n} stronach TOP10)_"
-        L(f"{idx}. **H2: {sec.split('/')[0].strip().capitalize()}** — {why}{mark}")
-        idx += 1
+    L(f"**H1:** {h1}\n")
+    themes = a.get("h2_themes", [])
+    if themes:
+        L("Tematy H2 powtarzające się w nagłówkach TOP10 (kolejność wg pokrycia):\n")
+        for idx, t in enumerate(themes, start=1):
+            L(f"{idx}. **H2: {t['example']}** _(na {t['pages']}/{n} stronach TOP10)_")
+    else:
+        L("_Zbyt mało nagłówków H2 w sklawlowanych stronach, by wskazać powtarzalne tematy — "
+          "oprzyj strukturę na liście najczęstszych terminów i PAA powyżej._")
     L("")
-    L(f"**Cel objętości:** ~{a['avg_words']} słów (dorównaj średniej TOP10).  ")
+    if a["paa"]:
+        L(f"- **H2: FAQ** — odpowiedz wprost na {len(a['paa'])} pytań z People Also Ask (Schema `FAQPage`, szansa na featured snippet).")
+    wc = sorted(a["word_counts"])
+    median = wc[len(wc) // 2] if wc else 0
+    L(f"\n**Cel objętości:** mediana TOP10 ~{median} słów (średnia ~{a['avg_words']}; "
+      f"zakres {min(wc) if wc else 0}–{max(wc) if wc else 0} — kieruj się medianą, średnią zawyżają outliery).  ")
     L("**On-page:** fraza w title, H1, URL, pierwszym akapicie; nasycenie pokrewnymi terminami (lista wyżej).  ")
     if a["has_local_pack"]:
-        L("**Local SEO (priorytet):** zoptymalizuj Google Business Profile, zbieraj opinie, dodaj Schema LocalBusiness + dane NAP.")
+        L("**Local SEO:** zoptymalizuj Google Business Profile, zbieraj opinie, dodaj Schema LocalBusiness + dane NAP.")
     L("")
     return "\n".join(lines)
 
@@ -433,7 +462,7 @@ async def main():
                    ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("[3/4] Analizuję dane...")
-    a = analyze(serp, pages_meta)
+    a = analyze(serp, pages_meta, args.keyword)
 
     print("[4/4] Generuję raport...")
     report = build_report(args.keyword, args.gl, args.hl, args.device, serp, pages_meta, a)
